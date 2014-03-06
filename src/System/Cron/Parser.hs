@@ -109,14 +109,9 @@ cronFieldP = steppedP  <|>
                         rangeP   <|>
                         steppedP <|>
                         specificP
-        stepListP     = ListField <$> A.sepBy1 stepListableP (A.char ',')
-        stepListableP = starP  <|>
-                        rangeP
         steppedP      = StepField <$> steppableP <*> (A.char '/' *> parseInt)
         steppableP    = starP     <|>
-                        rangeP    <|>
-                        stepListP <|>
-                        specificP
+                        rangeP
         specificP     = SpecificField <$> parseInt
 
 yearlyP :: Parser CronSchedule
