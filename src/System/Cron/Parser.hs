@@ -11,27 +11,37 @@
 --
 -- Attoparsec parser combinator for cron schedules. See cron documentation for
 -- how those are formatted.
--- 
--- > import Data.Attoparsec.Text (parseOnly)
+--
 -- > import System.Cron.Parser
--- > 
+-- >
 -- > main :: IO ()
--- > main = do
--- >   print $ parseOnly cronSchedule "*/2 * 3 * 4,5,6"
--- 
+-- > main = don
+-- >   print $ parseCronSchedule "*/2 * 3 * 4,5,6"
+--
 --------------------------------------------------------------------
-module System.Cron.Parser (cronSchedule,
-                           cronScheduleLoose,
-                           crontab,
-                           crontabEntry) where
+module System.Cron.Parser
+    ( -- * Parsers
+      cronSchedule
+    , cronScheduleLoose
+    , crontab
+    , crontabEntry
+    -- * Convenience Functions
+    , parseCronSchedule
+    , parseCrontab
+    , parseCrontabEntry
+    ) where
 
-import           System.Cron
-
-import           Control.Applicative  (pure, (*>), (<$>), (<*), (<*>), (<|>))
-import           Data.Char (isSpace)
+-------------------------------------------------------------------------------
+import           Control.Applicative  as Ap
 import           Data.Attoparsec.Text (Parser)
 import qualified Data.Attoparsec.Text as A
-import           Data.Text (Text)
+import           Data.Char            (isSpace)
+import           Data.List.NonEmpty   (NonEmpty (..))
+import           Data.Text            (Text)
+-------------------------------------------------------------------------------
+import           System.Cron.Types
+-------------------------------------------------------------------------------
+
 
 -- | Attoparsec Parser for a cron schedule. Complies fully with the standard
 -- cron format.  Also includes the following shorthand formats which cron also
@@ -42,6 +52,8 @@ import           Data.Text (Text)
 cronSchedule :: Parser CronSchedule
 cronSchedule = cronScheduleLoose <* A.endOfInput
 
+
+-------------------------------------------------------------------------------
 -- | Same as 'cronSchedule' but does not fail on extraneous input.
 cronScheduleLoose :: Parser CronSchedule
 cronScheduleLoose = yearlyP  <|>
@@ -51,6 +63,8 @@ cronScheduleLoose = yearlyP  <|>
                     hourlyP  <|>
                     classicP
 
+
+-------------------------------------------------------------------------------
 -- | Parses a full crontab file, omitting comments and including environment
 -- variable sets (e.g FOO=BAR).
 crontab :: Parser Crontab
@@ -58,6 +72,8 @@ crontab = Crontab <$> A.sepBy lineP (A.char '\n')
   where lineP    = A.skipMany commentP *> crontabEntry
         commentP = A.skipSpace *> A.char '#' *> skipToEOL
 
+
+-------------------------------------------------------------------------------
 -- | Parses an individual crontab line, which is either a scheduled command or
 -- an environmental variable set.
 crontabEntry :: Parser CrontabEntry
@@ -72,15 +88,43 @@ crontabEntry = A.skipSpace *> parser
                           A.skipWhile (\c -> c == ' ' || c == '\t')
                           return $ EnvVariable var val
         commandEntryP = CommandEntry <$> cronScheduleLoose
-                                     <*> (A.skipSpace *> takeToEOL)
+                                     <*> (A.skipSpace *> (CronCommand <$> takeToEOL))
 
----- Internals
+
+-------------------------------------------------------------------------------
+-- Convenience functions
+-------------------------------------------------------------------------------
+
+
+parseCronSchedule :: Text -> Either String CronSchedule
+parseCronSchedule = A.parseOnly cronSchedule
+
+
+-------------------------------------------------------------------------------
+parseCrontab :: Text -> Either String Crontab
+parseCrontab = A.parseOnly crontab
+
+
+-------------------------------------------------------------------------------
+parseCrontabEntry :: Text -> Either String CrontabEntry
+parseCrontabEntry = A.parseOnly crontabEntry
+
+
+-------------------------------------------------------------------------------
+-- Internals
+-------------------------------------------------------------------------------
+
+
 takeToEOL :: Parser Text
 takeToEOL = A.takeTill (== '\n') -- <* A.skip (== '\n')
 
+
+-------------------------------------------------------------------------------
 skipToEOL :: Parser ()
 skipToEOL = A.skipWhile (/= '\n')
 
+
+-------------------------------------------------------------------------------
 classicP :: Parser CronSchedule
 classicP = CronSchedule <$> (minutesP    <* space)
                         <*> (hoursP      <* space)
@@ -89,67 +133,118 @@ classicP = CronSchedule <$> (minutesP    <* space)
                         <*> dayOfWeekP
   where space = A.char ' '
 
-cronFieldP :: Parser CronField
-cronFieldP = steppedP  <|>
-             rangeP    <|>
-             listP     <|>
-             starP     <|>
-             specificP
-  where starP         = A.char '*' *> pure Star
-        rangeP        = do start <- parseInt
-                           _     <- A.char '-'
-                           end   <- parseInt
-                           if start <= end
-                             then return $ RangeField start end
-                             else rangeInvalid
-        rangeInvalid  = fail "start of range must be less than or equal to end"
-        -- Must avoid infinitely recursive parsers
-        listP         = reduceList <$> A.sepBy1 listableP (A.char ',')
-        listableP     = starP    <|>
-                        rangeP   <|>
-                        steppedP <|>
-                        specificP
-        steppedP      = StepField <$> steppableP <*> (A.char '/' *> parseInt)
-        steppableP    = starP     <|>
-                        rangeP
-        specificP     = SpecificField <$> parseInt
 
+-------------------------------------------------------------------------------
+cronFieldP :: Parser CronField
+cronFieldP = stepP  <|>
+             listP  <|>
+             fieldP
+
+  where
+    fieldP        = Field <$> baseFieldP
+    listP         = ListField <$> neListP baseFieldP
+    stepP         = StepField' <$> stepFieldP
+
+
+-------------------------------------------------------------------------------
+stepFieldP :: Parser StepField
+stepFieldP = do
+  f <- baseFieldP
+  _ <- A.char '/'
+  mParse (mkStepField f) "invalid stepping" =<< parseInt
+
+
+-------------------------------------------------------------------------------
+neListP :: Parser a -> Parser (NonEmpty a)
+neListP p = coerceNE =<< A.sepBy1 p (A.char ',')
+  where
+    coerceNE []     = fail "expected non-empty list"
+    coerceNE [_]    = fail "invalid singleton list"
+    coerceNE (x:xs) = return $ x :| xs
+
+
+-------------------------------------------------------------------------------
+baseFieldP :: Parser BaseField
+baseFieldP = rangeP <|>
+             starP  <|>
+             specificP
+  where starP         = A.char '*' *> Ap.pure Star
+        rangeP        = RangeField' <$> rangeFieldP
+        specificP     = SpecificField' <$> specificFieldP
+
+
+-------------------------------------------------------------------------------
+specificFieldP :: Parser SpecificField
+specificFieldP =
+  mParse mkSpecificField "specific field value out of range" =<< parseInt
+
+
+-------------------------------------------------------------------------------
+rangeFieldP :: Parser RangeField
+rangeFieldP = do
+  begin <- parseInt
+
+
+  _ <- A.char '-'
+  end <- parseInt
+  mParse (mkRangeField begin) "start of range must be less than or equal to end" end
+
+
+-------------------------------------------------------------------------------
 yearlyP :: Parser CronSchedule
 yearlyP  = A.string "@yearly"  *> pure yearly
 
+
+-------------------------------------------------------------------------------
 monthlyP :: Parser CronSchedule
 monthlyP = A.string "@monthly" *> pure monthly
 
+
+-------------------------------------------------------------------------------
 weeklyP :: Parser CronSchedule
 weeklyP  = A.string "@weekly"  *> pure weekly
 
+
+-------------------------------------------------------------------------------
 dailyP :: Parser CronSchedule
 dailyP   = A.string "@daily"   *> pure daily
 
+
+-------------------------------------------------------------------------------
 hourlyP :: Parser CronSchedule
 hourlyP  = A.string "@hourly"  *> pure hourly
 
 
---TODO: must handle a combination of many of these. EITHER just *, OR a list of
+-------------------------------------------------------------------------------
 minutesP :: Parser MinuteSpec
-minutesP = Minutes <$> cronFieldP
+minutesP = mParse mkMinuteSpec "minutes out of range" =<< cronFieldP
 
+
+-------------------------------------------------------------------------------
 hoursP :: Parser HourSpec
-hoursP = Hours <$> cronFieldP
+hoursP = mParse mkHourSpec "hours out of range" =<< cronFieldP
 
+
+-------------------------------------------------------------------------------
 dayOfMonthP :: Parser DayOfMonthSpec
-dayOfMonthP = DaysOfMonth <$> cronFieldP
+dayOfMonthP = mParse mkDayOfMonthSpec "day of month out of range" =<< cronFieldP
 
+
+-------------------------------------------------------------------------------
 monthP :: Parser MonthSpec
-monthP = Months <$> cronFieldP
+monthP = mParse mkMonthSpec "month out of range" =<< cronFieldP
 
+
+-------------------------------------------------------------------------------
 dayOfWeekP :: Parser DayOfWeekSpec
-dayOfWeekP = DaysOfWeek <$> cronFieldP
+dayOfWeekP = mParse mkDayOfWeekSpec "day of week out of range" =<< cronFieldP
 
+
+-------------------------------------------------------------------------------
 parseInt :: Parser Int
 parseInt = A.decimal
 
-reduceList :: [CronField] -> CronField
-reduceList []  = ListField [] -- this should not happen
-reduceList [x] = x
-reduceList xs  = ListField xs
+
+-------------------------------------------------------------------------------
+mParse :: (Monad m) => (a -> Maybe b) -> String -> a -> m b
+mParse f msg = maybe (fail msg) return . f
